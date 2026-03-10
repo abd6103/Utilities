@@ -1,0 +1,182 @@
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.text.PDFTextStripperByArea;
+import java.awt.geom.Rectangle2D;
+import java.io.*;
+import java.nio.file.*;
+import java.text.Normalizer;
+import java.util.*;
+import java.util.regex.*;
+
+/**
+ * Rule: Transactional alert email with a clickable verify/confirm link = ILLEGAL.
+ * Returns true = SAFE, false = SPAM.
+ */
+public class TransactionAlertValidator {
+
+    private static final Pattern GATE1 = Pattern.compile(
+        "\\b(?:suspicious|unusual|fraudulent|unauthorized)\\s+(?:\\w+\\s+){0,2}(?:transaction|payment|activity)(?:\\s+alert)?\\b" +
+        "|\\b(?:transaction(?:al)?|payment|security|account)\\s+alert\\b",
+        Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern GATE2 = Pattern.compile(
+        "\\b(?:verify|confirm|authenticate|validate|authorize|secure|approve|resolve|unlock|restore|recover|update|complete)" +
+        "\\s+(?:\\w+\\s+){0,3}(?:transaction|account|payment|identity|credentials|details|access|card)\\b" +
+        "|\\b(?:click|tap)\\s+(?:here|now|below)\\s+to\\s+(?:verify|confirm)\\b",
+        Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern URL_RE = Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
+
+    // ── Entry ─────────────────────────────────────────────────────────────────
+
+    public static boolean isValid(String path) {
+        try {
+            return switch (ext(path)) {
+                case "pdf" -> checkPdf(PDDocument.load(new File(path)));
+                case "txt" -> checkText(Files.readString(Path.of(path)));
+                case "eml" -> checkEml(Files.readString(Path.of(path)));
+                default    -> checkHtml(Files.readString(Path.of(path)));
+            };
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    // ── HTML ──────────────────────────────────────────────────────────────────
+
+    private static boolean checkHtml(String html) {
+        Document doc = Jsoup.parse(html);
+
+        // FIX 4: Expanded selector — covers image links, SVG anchors, styled clickables
+        if (!GATE1.matcher(norm(doc.text())).find()) return true;
+
+        for (Element el : doc.select(
+                "a[href], button, input[type=submit], input[type=image], " +
+                "[onclick], area[href], [formaction], svg a, " +
+                "[style*='cursor:pointer'], [role=button]")) {
+
+            // FIX 1: Use StringBuilder — String.concat() was returning
+            //         a new value that was silently discarded
+            StringBuilder sb = new StringBuilder();
+            sb.append(el.text()).append(' ')
+              .append(el.attr("value")).append(' ')
+              .append(el.attr("alt")).append(' ')
+              .append(el.attr("aria-label")).append(' ')
+              .append(el.attr("title")).append(' ');
+
+            // alt-text from child images (was broken before)
+            el.select("img").forEach(img ->
+                sb.append(img.attr("alt")).append(' ')
+                  .append(img.attr("title")).append(' '));
+
+            // FIX 2: Normalize before matching
+            if (GATE2.matcher(norm(sb.toString())).find()) return false;
+        }
+        return true;
+    }
+
+    // ── Plain text ────────────────────────────────────────────────────────────
+
+    private static boolean checkText(String text) {
+        // FIX 2: Normalize before matching
+        String n = norm(text);
+        return !GATE1.matcher(n).find()
+            || !(URL_RE.matcher(text).find() && GATE2.matcher(n).find());
+    }
+
+    // ── PDF ───────────────────────────────────────────────────────────────────
+
+    private static boolean checkPdf(PDDocument pdf) throws Exception {
+        try (pdf) {
+            // FIX 2: Normalize extracted text
+            String body = norm(new PDFTextStripper().getText(pdf));
+            if (!GATE1.matcher(body).find()) return true;
+
+            for (PDPage page : pdf.getPages()) {
+                float pageH = page.getMediaBox().getHeight();
+                for (PDAnnotationLink link : page.getAnnotations(PDAnnotationLink.class)) {
+                    PDRectangle r = link.getRectangle();
+                    if (r == null) continue;
+
+                    // FIX 3: ±2px padding — avoids missing link text
+                    //         due to tight bounding box in PDF spec
+                    PDFTextStripperByArea area = new PDFTextStripperByArea();
+                    area.setSortByPosition(true);
+                    area.addRegion("r", new Rectangle2D.Float(
+                        r.getLowerLeftX()  - 2,
+                        pageH - r.getUpperRightY() - 2,
+                        r.getWidth()  + 4,
+                        r.getHeight() + 4));
+                    area.extractRegions(page);
+
+                    String linkText = area.getTextForRegion("r");
+                    // FIX 2: Normalize before matching
+                    if (linkText != null && GATE2.matcher(norm(linkText)).find()) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // ── EML ───────────────────────────────────────────────────────────────────
+
+    private static boolean checkEml(String raw) throws Exception {
+        Matcher hm = Pattern.compile("<html[^>]*>[\\s\\S]*?</html>",
+            Pattern.CASE_INSENSITIVE).matcher(raw);
+        boolean hasHtml = false;
+        while (hm.find()) {
+            hasHtml = true;
+            if (!checkHtml(hm.group())) return false;
+        }
+        if (!hasHtml) {
+            int i = raw.indexOf("\r\n\r\n");
+            if (i < 0) i = raw.indexOf("\n\n");
+            if (i >= 0 && !checkText(raw.substring(i).trim())) return false;
+        }
+        Matcher pm = Pattern.compile(
+            "Content-Type:\\s*application/pdf[\\s\\S]*?base64\\s*\\n\\s*\\n([A-Za-z0-9+/=\\s]+?)\\n--",
+            Pattern.CASE_INSENSITIVE).matcher(raw);
+        while (pm.find()) {
+            byte[] b = Base64.getMimeDecoder().decode(pm.group(1).replaceAll("\\s+", ""));
+            if (!checkPdf(PDDocument.load(new ByteArrayInputStream(b)))) return false;
+        }
+        return true;
+    }
+
+    // ── Normalization (FIX 2) ─────────────────────────────────────────────────
+    // Handles: zero-width chars, HTML entities, diacritics, extra whitespace
+
+    private static String norm(String s) {
+        if (s == null || s.isEmpty()) return "";
+        // Zero-width / invisible chars
+        s = s.replaceAll("[\\u200B-\\u200F\\uFEFF\\u00AD\\u034F\\u061C\\u180E]", "");
+        // HTML entities
+        s = s.replaceAll("&nbsp;", " ").replaceAll("&#?\\w+;", " ");
+        // NFKD decomposition + strip diacritics (catches é→e, ñ→n etc.)
+        s = Normalizer.normalize(s, Normalizer.Form.NFKD)
+                      .replaceAll("\\p{M}", "");
+        // Collapse whitespace + lowercase
+        return s.replaceAll("\\s+", " ").trim().toLowerCase();
+    }
+
+    // ── Util ──────────────────────────────────────────────────────────────────
+
+    private static String ext(String p) {
+        int d = p.lastIndexOf('.');
+        return d >= 0 ? p.substring(d + 1).toLowerCase() : "";
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length == 0) {
+            System.out.println("Usage: java TransactionAlertValidator <file>");
+            return;
+        }
+        System.out.println(isValid(args[0]) ? "✅ SAFE" : "❌ SPAM");
+    }
+}
