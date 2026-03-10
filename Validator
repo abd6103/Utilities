@@ -7,105 +7,139 @@ import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.PDFTextStripperByArea;
+import com.sun.mail.util.BASE64DecoderStream;
+import javax.mail.*;
+import javax.mail.internet.*;
 import java.awt.geom.Rectangle2D;
 import java.io.*;
 import java.nio.file.*;
 import java.text.Normalizer;
-import java.util.*;
+import java.util.Properties;
 import java.util.regex.*;
 
 /**
- * Rule: Transactional alert email with a clickable verify/confirm link = ILLEGAL.
+ * Validates .eml files ONLY.
+ * Rule: Transactional alert email + clickable verify/confirm link = ILLEGAL.
  * Returns true = SAFE, false = SPAM.
+ *
+ * Maven dependencies:
+ *   jsoup          1.17.2
+ *   pdfbox         2.0.31
+ *   jakarta.mail   2.0.1
  */
 public class TransactionAlertValidator {
 
     private static final Pattern GATE1 = Pattern.compile(
-        "\\b(?:suspicious|unusual|fraudulent|unauthorized)\\s+(?:\\w+\\s+){0,2}(?:transaction|payment|activity)(?:\\s+alert)?\\b" +
+        "\\b(?:suspicious|unusual|fraudulent|unauthorized)\\s+(?:\\w+\\s+){0,2}" +
+        "(?:transaction|payment|activity)(?:\\s+alert)?\\b" +
         "|\\b(?:transaction(?:al)?|payment|security|account)\\s+alert\\b",
         Pattern.CASE_INSENSITIVE);
 
     private static final Pattern GATE2 = Pattern.compile(
-        "\\b(?:verify|confirm|authenticate|validate|authorize|secure|approve|resolve|unlock|restore|recover|update|complete)" +
+        "\\b(?:verify|confirm|authenticate|validate|authorize|secure|approve|" +
+        "resolve|unlock|restore|recover|update|complete)" +
         "\\s+(?:\\w+\\s+){0,3}(?:transaction|account|payment|identity|credentials|details|access|card)\\b" +
         "|\\b(?:click|tap)\\s+(?:here|now|below)\\s+to\\s+(?:verify|confirm)\\b",
         Pattern.CASE_INSENSITIVE);
 
-    private static final Pattern URL_RE = Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
+    private static final Pattern URL_RE =
+        Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
 
-    // ── Entry ─────────────────────────────────────────────────────────────────
+    // ── Entry point: .eml ONLY ────────────────────────────────────────────────
 
-    public static boolean isValid(String path) {
-        try {
-            return switch (ext(path)) {
-                case "pdf" -> checkPdf(PDDocument.load(new File(path)));
-                case "txt" -> checkText(Files.readString(Path.of(path)));
-                case "eml" -> checkEml(Files.readString(Path.of(path)));
-                default    -> checkHtml(Files.readString(Path.of(path)));
-            };
+    public static boolean isValid(String emlPath) {
+        try (InputStream is = Files.newInputStream(Path.of(emlPath))) {
+            MimeMessage msg = new MimeMessage(
+                Session.getDefaultInstance(new Properties()), is);
+            return checkPart(msg);
         } catch (Exception e) {
+            System.err.println("[ERROR] " + e.getMessage());
             return true;
         }
     }
 
-    // ── HTML ──────────────────────────────────────────────────────────────────
+    // ── MIME part walker (handles any nesting depth) ──────────────────────────
+
+    private static boolean checkPart(Part part) throws Exception {
+
+        // Multipart/* → recurse into every child part
+        if (part.isMimeType("multipart/*")) {
+            Multipart mp = (Multipart) part.getContent();
+            for (int i = 0; i < mp.getCount(); i++)
+                if (!checkPart(mp.getBodyPart(i))) return false;
+            return true;
+        }
+
+        // HTML body → main attack surface
+        if (part.isMimeType("text/html")) {
+            // getContent() auto-decodes quoted-printable AND base64
+            return checkHtml((String) part.getContent());
+        }
+
+        // Plain text body
+        if (part.isMimeType("text/plain")) {
+            return checkText((String) part.getContent());
+        }
+
+        // PDF attachment
+        if (part.isMimeType("application/pdf")) {
+            try (InputStream is = part.getInputStream()) {
+                return checkPdf(PDDocument.load(is));
+            }
+        }
+
+        return true; // ignore unknown parts
+    }
+
+    // ── HTML check ────────────────────────────────────────────────────────────
 
     private static boolean checkHtml(String html) {
         Document doc = Jsoup.parse(html);
-
-        // FIX 4: Expanded selector — covers image links, SVG anchors, styled clickables
         if (!GATE1.matcher(norm(doc.text())).find()) return true;
 
         for (Element el : doc.select(
                 "a[href], button, input[type=submit], input[type=image], " +
-                "[onclick], area[href], [formaction], svg a, " +
+                "[onclick], area[href], [formaction], svg a, "             +
                 "[style*='cursor:pointer'], [role=button]")) {
 
-            // FIX 1: Use StringBuilder — String.concat() was returning
-            //         a new value that was silently discarded
             StringBuilder sb = new StringBuilder();
-            sb.append(el.text()).append(' ')
-              .append(el.attr("value")).append(' ')
-              .append(el.attr("alt")).append(' ')
+            sb.append(el.text())            .append(' ')
+              .append(el.attr("value"))     .append(' ')
+              .append(el.attr("alt"))       .append(' ')
               .append(el.attr("aria-label")).append(' ')
-              .append(el.attr("title")).append(' ');
+              .append(el.attr("title"))     .append(' ');
 
-            // alt-text from child images (was broken before)
             el.select("img").forEach(img ->
-                sb.append(img.attr("alt")).append(' ')
+                sb.append(img.attr("alt"))  .append(' ')
                   .append(img.attr("title")).append(' '));
 
-            // FIX 2: Normalize before matching
             if (GATE2.matcher(norm(sb.toString())).find()) return false;
         }
         return true;
     }
 
-    // ── Plain text ────────────────────────────────────────────────────────────
+    // ── Plain text check ──────────────────────────────────────────────────────
 
     private static boolean checkText(String text) {
-        // FIX 2: Normalize before matching
         String n = norm(text);
         return !GATE1.matcher(n).find()
             || !(URL_RE.matcher(text).find() && GATE2.matcher(n).find());
     }
 
-    // ── PDF ───────────────────────────────────────────────────────────────────
+    // ── PDF attachment check ──────────────────────────────────────────────────
 
     private static boolean checkPdf(PDDocument pdf) throws Exception {
         try (pdf) {
-            // FIX 2: Normalize extracted text
             String body = norm(new PDFTextStripper().getText(pdf));
             if (!GATE1.matcher(body).find()) return true;
 
             for (PDPage page : pdf.getPages()) {
                 float pageH = page.getMediaBox().getHeight();
-                for (PDAnnotationLink link : page.getAnnotations(PDAnnotationLink.class)) {
+                for (PDAnnotationLink link :
+                        page.getAnnotations(PDAnnotationLink.class)) {
                     PDRectangle r = link.getRectangle();
                     if (r == null) continue;
 
-                    // FIX 3: ±2px padding — avoids missing link text
-                    //         due to tight bounding box in PDF spec
                     PDFTextStripperByArea area = new PDFTextStripperByArea();
                     area.setSortByPosition(true);
                     area.addRegion("r", new Rectangle2D.Float(
@@ -115,66 +149,30 @@ public class TransactionAlertValidator {
                         r.getHeight() + 4));
                     area.extractRegions(page);
 
-                    String linkText = area.getTextForRegion("r");
-                    // FIX 2: Normalize before matching
-                    if (linkText != null && GATE2.matcher(norm(linkText)).find()) return false;
+                    String lt = area.getTextForRegion("r");
+                    if (lt != null && GATE2.matcher(norm(lt)).find()) return false;
                 }
             }
         }
         return true;
     }
 
-    // ── EML ───────────────────────────────────────────────────────────────────
-
-    private static boolean checkEml(String raw) throws Exception {
-        Matcher hm = Pattern.compile("<html[^>]*>[\\s\\S]*?</html>",
-            Pattern.CASE_INSENSITIVE).matcher(raw);
-        boolean hasHtml = false;
-        while (hm.find()) {
-            hasHtml = true;
-            if (!checkHtml(hm.group())) return false;
-        }
-        if (!hasHtml) {
-            int i = raw.indexOf("\r\n\r\n");
-            if (i < 0) i = raw.indexOf("\n\n");
-            if (i >= 0 && !checkText(raw.substring(i).trim())) return false;
-        }
-        Matcher pm = Pattern.compile(
-            "Content-Type:\\s*application/pdf[\\s\\S]*?base64\\s*\\n\\s*\\n([A-Za-z0-9+/=\\s]+?)\\n--",
-            Pattern.CASE_INSENSITIVE).matcher(raw);
-        while (pm.find()) {
-            byte[] b = Base64.getMimeDecoder().decode(pm.group(1).replaceAll("\\s+", ""));
-            if (!checkPdf(PDDocument.load(new ByteArrayInputStream(b)))) return false;
-        }
-        return true;
-    }
-
-    // ── Normalization (FIX 2) ─────────────────────────────────────────────────
-    // Handles: zero-width chars, HTML entities, diacritics, extra whitespace
+    // ── Normalization ─────────────────────────────────────────────────────────
 
     private static String norm(String s) {
         if (s == null || s.isEmpty()) return "";
-        // Zero-width / invisible chars
         s = s.replaceAll("[\\u200B-\\u200F\\uFEFF\\u00AD\\u034F\\u061C\\u180E]", "");
-        // HTML entities
         s = s.replaceAll("&nbsp;", " ").replaceAll("&#?\\w+;", " ");
-        // NFKD decomposition + strip diacritics (catches é→e, ñ→n etc.)
         s = Normalizer.normalize(s, Normalizer.Form.NFKD)
                       .replaceAll("\\p{M}", "");
-        // Collapse whitespace + lowercase
         return s.replaceAll("\\s+", " ").trim().toLowerCase();
     }
 
-    // ── Util ──────────────────────────────────────────────────────────────────
+    // ── Main ──────────────────────────────────────────────────────────────────
 
-    private static String ext(String p) {
-        int d = p.lastIndexOf('.');
-        return d >= 0 ? p.substring(d + 1).toLowerCase() : "";
-    }
-
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         if (args.length == 0) {
-            System.out.println("Usage: java TransactionAlertValidator <file>");
+            System.out.println("Usage: java TransactionAlertValidator <file.eml>");
             return;
         }
         System.out.println(isValid(args[0]) ? "✅ SAFE" : "❌ SPAM");
